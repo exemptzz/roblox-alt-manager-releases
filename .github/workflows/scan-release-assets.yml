@@ -1,0 +1,117 @@
+name: Scan release assets for secrets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to scan (for example v1.0.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scan-release-assets:
+    name: Scan published release assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh release download "${{ steps.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --dir release-assets
+          if [ -z "$(find release-assets -mindepth 1 -print -quit)" ]; then
+            echo "::error::No release assets found for tag ${{ steps.meta.outputs.tag }}."
+            exit 1
+          fi
+
+      - name: Install Gitleaks
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION=8.22.1
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Install TruffleHog
+        run: |
+          set -euo pipefail
+          TRUFFLEHOG_VERSION=3.88.29
+          curl -sSfL \
+            "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz
+          sudo install -m 0755 trufflehog /usr/local/bin/trufflehog
+          trufflehog --version
+
+      - name: Extract archives and scan for secrets
+        run: |
+          set -euo pipefail
+          SCAN_ROOT="${{ runner.temp }}/release-scan"
+          mkdir -p "$SCAN_ROOT"
+          cp -a release-assets/. "$SCAN_ROOT/"
+
+          while IFS= read -r -d '' archive; do
+            dest="${archive}.extracted"
+            mkdir -p "$dest"
+            case "$archive" in
+              *.zip) unzip -oq "$archive" -d "$dest" || true ;;
+              *.tar.gz|*.tgz) tar -xzf "$archive" -C "$dest" || true ;;
+              *.tar) tar -xf "$archive" -C "$dest" || true ;;
+            esac
+          done < <(find "$SCAN_ROOT" -type f \( -name '*.zip' -o -name '*.tar' -o -name '*.tar.gz' -o -name '*.tgz' \) -print0)
+
+          FAIL=0
+
+          echo "Running Gitleaks filesystem scan (no-git)..."
+          if ! gitleaks detect --source "$SCAN_ROOT" --no-git --verbose --redact --exit-code 2; then
+            echo "::error::Gitleaks reported potential secrets in release assets."
+            FAIL=1
+          fi
+
+          echo "Running TruffleHog filesystem scan..."
+          if ! trufflehog filesystem "$SCAN_ROOT" --results=verified,unknown --fail --no-update; then
+            echo "::error::TruffleHog reported potential secrets in release assets."
+            FAIL=1
+          fi
+
+          echo "Running pattern scan on extracted strings (redacted output)..."
+          STRINGS_FILE="$(mktemp)"
+          find "$SCAN_ROOT" -type f -print0 | while IFS= read -r -d '' file; do
+            strings -a "$file" >> "$STRINGS_FILE" 2>/dev/null || true
+          done
+
+          if grep -qE 'BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY' "$STRINGS_FILE"; then
+            echo "::error::Found PEM private key material in release asset strings."
+            FAIL=1
+          fi
+
+          if grep -qE '(ghp_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})' "$STRINGS_FILE"; then
+            echo "::error::Found suspicious token-like strings in release assets."
+            FAIL=1
+          fi
+
+          rm -f "$STRINGS_FILE"
+
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
+          echo "No secrets detected in release assets for tag ${{ steps.meta.outputs.tag }}."
